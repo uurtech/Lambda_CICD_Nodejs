@@ -1,6 +1,13 @@
 # Workflow name that appears in GitHub Actions UI
 name: Lambda CI/CD
 
+# Define environment variables used across jobs
+env:
+  NODE_VERSION: '18'
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  # Add environment-specific config files
+  CONFIG_PATH: ./config
+
 # Define when this workflow will be triggered
 on:
   push:
@@ -8,6 +15,10 @@ on:
       - dev    # Development branch
       - stag   # Staging branch
       - master # Production branch
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.gitignore'
   pull_request:
     branches: 
       - dev
@@ -26,15 +37,31 @@ jobs:
     - name: Setup Node.js
       uses: actions/setup-node@v3
       with:
-        node-version: '18'
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm' # Enable npm caching
         
     # Install project dependencies
     - name: Install dependencies
-      run: npm ci
+      run: |
+        npm ci
+        npm audit # Security check
       
     # Run test suite
     - name: Run tests
       run: npm test
+      
+    # Run linting
+    - name: Lint code
+      run: npm run lint
+      
+    # Cache build artifacts
+    - name: Cache build
+      uses: actions/cache@v3
+      with:
+        path: |
+          dist
+          node_modules
+        key: ${{ runner.os }}-build-${{ github.sha }}
       
     # Send notification to Slack for any branch update
     - name: Notify Slack on Branch Update
@@ -47,76 +74,85 @@ jobs:
         SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
       if: always()
 
-  # Development environment deployment job
-  deploy-dev:
+  # Deployment job template
+  deploy:
     needs: build-and-test
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/dev'
-    environment: 
-      name: development
-      url: ${{ steps.deploy.outputs.url }}
-    # ... same steps as production but with dev Lambda function
-
-  # Staging environment deployment job
-  deploy-staging:
-    needs: build-and-test
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/stag'
-    environment: 
-      name: staging
-      url: ${{ steps.deploy.outputs.url }}
-    # ... same steps as production but with staging Lambda function
-
-  # Production environment deployment job with manual approval
-  deploy-production:
-    needs: build-and-test
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/master'
-    # This environment configuration requires manual approval
-    # Configure required reviewers in GitHub repository settings:
-    # Settings -> Environments -> production -> Required reviewers
-    environment: 
-      name: production
+    strategy:
+      matrix:
+        include:
+          - environment: development
+            branch: dev
+            requires_approval: false
+          - environment: staging
+            branch: stag
+            requires_approval: false
+          - environment: production
+            branch: master
+            requires_approval: true
+    if: github.ref == format('refs/heads/{0}', matrix.branch)
+    environment:
+      name: ${{ matrix.environment }}
       url: ${{ steps.deploy.outputs.url }}
     
     steps:
-    # Checkout code from repository
-    - uses: actions/checkout@v3
-    
-    # Setup Node.js runtime
-    - name: Setup Node.js
-      uses: actions/setup-node@v3
+    # Restore cached build
+    - uses: actions/cache@v3
       with:
-        node-version: '18'
-        
+        path: |
+          dist
+          node_modules
+        key: ${{ runner.os }}-build-${{ github.sha }}
+    
     # Configure AWS credentials for deployment
     - name: Configure AWS Credentials
       uses: aws-actions/configure-aws-credentials@v1
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ secrets.AWS_REGION }}
+        aws-region: ${{ env.AWS_REGION }}
         
-    # Install project dependencies
-    - name: Install dependencies
-      run: npm ci
+    # Load environment-specific configuration
+    - name: Load environment config
+      run: |
+        echo "Loading config for ${{ matrix.environment }}"
+        source ${{ env.CONFIG_PATH }}/${{ matrix.environment }}.env
         
-    # Package and deploy code to AWS Lambda
-    - name: Deploy to Lambda
+    # Deploy to multiple Lambda functions
+    - name: Deploy to Lambda Functions
       id: deploy
       run: |
-        zip -r function.zip .
-        aws lambda update-function-code \
-          --function-name ${{ secrets.LAMBDA_FUNCTION_NAME }} \
-          --zip-file fileb://function.zip
+        # Read Lambda function names from environment variable
+        IFS=',' read -ra LAMBDA_FUNCTIONS <<< "${{ secrets.LAMBDA_FUNCTIONS }}"
+        
+        # Create deployment package
+        zip -r function.zip . -x "*.git*" "test/*" "docs/*" "*.md"
+        
+        # Deploy to each Lambda function
+        for function_name in "${LAMBDA_FUNCTIONS[@]}"; do
+          echo "Deploying to $function_name"
+          aws lambda update-function-code \
+            --function-name "$function_name" \
+            --zip-file fileb://function.zip \
+            --publish
+          
+          # Add version/alias management if needed
+          if [ "${{ matrix.environment }}" = "production" ]; then
+            VERSION=$(aws lambda publish-version --function-name "$function_name" --query 'Version' --output text)
+            aws lambda update-alias \
+              --function-name "$function_name" \
+              --name "PROD" \
+              --function-version "$VERSION"
+          fi
+        done
           
     # Send deployment notification to Slack
-    - name: Notify Slack on Production Deployment
+    - name: Notify Slack on Deployment
       uses: 8398a7/action-slack@v3
       with:
         status: ${{ job.status }}
         fields: repo,message,commit,author,action,eventName,ref,workflow
-        text: 'Production deployment completed for ${{ github.ref }}'
+        text: '${{ matrix.environment }} deployment completed for ${{ github.ref }}'
       env:
         SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
       if: success() 
