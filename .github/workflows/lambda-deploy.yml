@@ -1,0 +1,122 @@
+# Workflow name that appears in GitHub Actions UI
+name: Lambda CI/CD
+
+# Define when this workflow will be triggered
+on:
+  push:
+    branches: 
+      - dev    # Development branch
+      - stag   # Staging branch
+      - master # Production branch
+  pull_request:
+    branches: 
+      - dev
+      - stag
+      - master
+
+jobs:
+  # Job for building and testing the application
+  build-and-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    # Set up Node.js environment
+    - name: Setup Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: '18'
+        
+    # Install project dependencies
+    - name: Install dependencies
+      run: npm ci
+      
+    # Run test suite
+    - name: Run tests
+      run: npm test
+      
+    # Send notification to Slack for any branch update
+    - name: Notify Slack on Branch Update
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        fields: repo,message,commit,author,action,eventName,ref,workflow
+        text: 'Branch update in ${{ github.ref }}'
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      if: always()
+
+  # Development environment deployment job
+  deploy-dev:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/dev'
+    environment: 
+      name: development
+      url: ${{ steps.deploy.outputs.url }}
+    # ... same steps as production but with dev Lambda function
+
+  # Staging environment deployment job
+  deploy-staging:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/stag'
+    environment: 
+      name: staging
+      url: ${{ steps.deploy.outputs.url }}
+    # ... same steps as production but with staging Lambda function
+
+  # Production environment deployment job with manual approval
+  deploy-production:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/master'
+    # This environment configuration requires manual approval
+    # Configure required reviewers in GitHub repository settings:
+    # Settings -> Environments -> production -> Required reviewers
+    environment: 
+      name: production
+      url: ${{ steps.deploy.outputs.url }}
+    
+    steps:
+    # Checkout code from repository
+    - uses: actions/checkout@v3
+    
+    # Setup Node.js runtime
+    - name: Setup Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: '18'
+        
+    # Configure AWS credentials for deployment
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+        
+    # Install project dependencies
+    - name: Install dependencies
+      run: npm ci
+        
+    # Package and deploy code to AWS Lambda
+    - name: Deploy to Lambda
+      id: deploy
+      run: |
+        zip -r function.zip .
+        aws lambda update-function-code \
+          --function-name ${{ secrets.LAMBDA_FUNCTION_NAME }} \
+          --zip-file fileb://function.zip
+          
+    # Send deployment notification to Slack
+    - name: Notify Slack on Production Deployment
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        fields: repo,message,commit,author,action,eventName,ref,workflow
+        text: 'Production deployment completed for ${{ github.ref }}'
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      if: success() 
