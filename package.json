@@ -1,5 +1,11 @@
 {
   "scripts": {
-    "test": "your-test-command"
+    "test": "jest",
+    "lint": "eslint .",
+    "build": "your-build-command"
+  },
+  "devDependencies": {
+    "jest": "^29.0.0",
+    "eslint": "^8.0.0"
   }
 } 
